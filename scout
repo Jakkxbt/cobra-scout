@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""scout — keyword monitor across free public news sources.
+
+Sources: Google News RSS, Hacker News (Algolia), Reddit JSON.
+No X/Twitter or Facebook (no usable free API). No paid keys. No AI.
+
+Author: Jakkxbt
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+VERSION = "1.0.0"
+TIMEOUT = 12.0
+RESULTS_DIR = Path("scout-results")
+SEEN_PATH = Path.home() / ".config" / "cobra-scout" / "seen.json"
+UA = (
+    "scout/%s (keyword monitor; +https://github.com/Jakkxbt; "
+    "stdlib; authorised research)" % VERSION
+)
+# Browser-ish fallback for picky CDNs (Reddit often wants this shape)
+UA_BROWSER = (
+    "Mozilla/5.0 (compatible; scout/%s; +https://github.com/Jakkxbt)" % VERSION
+)
+
+
+def eprint(msg: str) -> None:
+    sys.stderr.write("scout: %s\n" % msg)
+    sys.stderr.flush()
+
+
+@dataclass
+class Match:
+    source: str
+    title: str
+    date: str
+    link: str
+    keyword: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def http_get(url: str, timeout: float = TIMEOUT, ua: str = UA) -> Tuple[int, bytes, Optional[str]]:
+    """Return (status, body, error). Never raises."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": ua,
+            "Accept": "application/json, application/rss+xml, application/xml, text/xml, */*",
+            "Accept-Language": "en-GB,en;q=0.9",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return getattr(resp, "status", 200) or 200, resp.read(), None
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read()
+        except Exception:
+            body = b""
+        return e.code, body, "HTTP %s" % e.code
+    except Exception as e:
+        return 0, b"", str(e)[:200]
+
+
+def _clean_text(s: str) -> str:
+    s = html.unescape(s or "")
+    s = re.sub(r"<[^>]+>", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _norm_link(link: str) -> str:
+    link = (link or "").strip()
+    if not link:
+        return ""
+    # strip common tracking fragments lightly
+    link = link.split("#")[0]
+    return link
+
+
+# ---- sources ----
+
+
+def source_google_news(keyword: str, timeout: float) -> Tuple[List[Match], Optional[str]]:
+    q = urllib.parse.quote_plus(keyword)
+    url = "https://news.google.com/rss/search?q=%s&hl=en-GB&gl=GB&ceid=GB:en" % q
+    status, body, err = http_get(url, timeout=timeout, ua=UA_BROWSER)
+    if err or status >= 400 or not body:
+        return [], err or ("HTTP %s" % status)
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as e:
+        return [], "bad RSS: %s" % e
+    out: List[Match] = []
+    for item in root.findall(".//item"):
+        title = _clean_text(item.findtext("title") or "")
+        link = _norm_link(item.findtext("link") or "")
+        date = _clean_text(item.findtext("pubDate") or "")
+        if not title and not link:
+            continue
+        out.append(
+            Match(source="google_news", title=title, date=date, link=link, keyword=keyword)
+        )
+    return out, None
+
+
+def source_hackernews(keyword: str, timeout: float) -> Tuple[List[Match], Optional[str]]:
+    q = urllib.parse.quote(keyword)
+    url = (
+        "https://hn.algolia.com/api/v1/search?query=%s&tags=story&hitsPerPage=25"
+        % q
+    )
+    status, body, err = http_get(url, timeout=timeout)
+    if err or status >= 400 or not body:
+        return [], err or ("HTTP %s" % status)
+    try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as e:
+        return [], "bad JSON: %s" % e
+    out: List[Match] = []
+    for hit in data.get("hits") or []:
+        if not isinstance(hit, dict):
+            continue
+        title = _clean_text(str(hit.get("title") or ""))
+        # prefer story URL, fall back to HN item
+        link = _norm_link(str(hit.get("url") or ""))
+        object_id = hit.get("objectID")
+        if not link and object_id is not None:
+            link = "https://news.ycombinator.com/item?id=%s" % object_id
+        created = hit.get("created_at") or ""
+        if isinstance(created, (int, float)):
+            date = datetime.fromtimestamp(created, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        else:
+            date = str(created)
+        if not title and not link:
+            continue
+        out.append(
+            Match(source="hacker_news", title=title, date=date, link=link, keyword=keyword)
+        )
+    return out, None
+
+
+def source_reddit(keyword: str, timeout: float) -> Tuple[List[Match], Optional[str]]:
+    q = urllib.parse.quote(keyword)
+    url = (
+        "https://www.reddit.com/search.json?q=%s&sort=new&limit=25&raw_json=1" % q
+    )
+    # try a couple of UAs — Reddit often 403s datacenter IPs regardless
+    last_err: Optional[str] = None
+    body = b""
+    status = 0
+    for ua in (UA, UA_BROWSER):
+        status, body, err = http_get(url, timeout=timeout, ua=ua)
+        if not err and status < 400 and body:
+            break
+        last_err = err or ("HTTP %s" % status)
+    else:
+        return [], last_err or "reddit unavailable"
+
+    try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as e:
+        return [], "bad JSON: %s" % e
+    children = ((data.get("data") or {}).get("children")) or []
+    out: List[Match] = []
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        d = child.get("data") or {}
+        if not isinstance(d, dict):
+            continue
+        title = _clean_text(str(d.get("title") or ""))
+        permalink = str(d.get("permalink") or "")
+        link = _norm_link(str(d.get("url") or ""))
+        if permalink:
+            hn_link = "https://www.reddit.com" + permalink
+            # prefer reddit post page for de-dupe consistency
+            link = hn_link
+        created = d.get("created_utc")
+        if isinstance(created, (int, float)):
+            date = datetime.fromtimestamp(created, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        else:
+            date = ""
+        if not title and not link:
+            continue
+        out.append(
+            Match(source="reddit", title=title, date=date, link=link, keyword=keyword)
+        )
+    return out, None
+
+
+SOURCES = (
+    ("google_news", source_google_news),
+    ("hacker_news", source_hackernews),
+    ("reddit", source_reddit),
+)
+
+
+def gather(keyword: str, timeout: float) -> Tuple[List[Match], Dict[str, str]]:
+    """Run all sources; return matches + per-source errors (skipped sources)."""
+    all_m: List[Match] = []
+    errors: Dict[str, str] = {}
+    for name, fn in SOURCES:
+        try:
+            matches, err = fn(keyword, timeout)
+            if err:
+                errors[name] = err
+            all_m.extend(matches or [])
+        except Exception as e:
+            errors[name] = str(e)[:200]
+    return all_m, errors
+
+
+def dedupe(matches: Iterable[Match]) -> List[Match]:
+    seen: Set[str] = set()
+    out: List[Match] = []
+    for m in matches:
+        key = _norm_link(m.link) or (m.source + "|" + m.title)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(m)
+    return out
+
+
+# ---- seen-cache for --watch ----
+
+
+def load_seen(path: Path = SEEN_PATH) -> Set[str]:
+    if not path.is_file():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("links"), list):
+            return {str(x) for x in data["links"] if x}
+        if isinstance(data, list):
+            return {str(x) for x in data if x}
+    except Exception as e:
+        eprint("could not read seen-cache (%s): %s" % (path, e))
+    return set()
+
+
+def save_seen(links: Set[str], path: Path = SEEN_PATH, cap: int = 50000) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # keep most recent-ish by just truncating set arbitrarily if huge
+    lst = sorted(links)
+    if len(lst) > cap:
+        lst = lst[-cap:]
+    payload = {
+        "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "links": lst,
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def filter_new(matches: List[Match], seen: Set[str]) -> List[Match]:
+    fresh: List[Match] = []
+    for m in matches:
+        key = _norm_link(m.link)
+        if not key or key in seen:
+            continue
+        fresh.append(m)
+    return fresh
+
+
+# ---- keywords / output ----
+
+
+def load_keywords(single: Optional[str], file_path: Optional[str]) -> List[str]:
+    kws: List[str] = []
+    if file_path:
+        path = Path(file_path).expanduser()
+        if not path.is_file():
+            eprint("keywords file not found: %s" % path)
+            raise SystemExit(2)
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            kws.append(line)
+    if single:
+        kws.append(single.strip())
+    seen: Set[str] = set()
+    out: List[str] = []
+    for k in kws:
+        k = k.strip()
+        if not k or k.lower() in seen:
+            continue
+        seen.add(k.lower())
+        out.append(k)
+    return out
+
+
+def sanitize_filename(keyword: str) -> str:
+    s = re.sub(r"[^\w.\-]+", "_", keyword.strip().lower())
+    return (s.strip("._-") or "keyword")[:80]
+
+
+def format_report(
+    keyword: str,
+    matches: List[Match],
+    errors: Dict[str, str],
+    watch: bool,
+) -> str:
+    lines: List[str] = []
+    lines.append("scout %s" % VERSION)
+    lines.append("keyword: %s" % keyword)
+    lines.append("mode: %s" % ("watch (new only)" if watch else "search"))
+    lines.append("scanned: %s" % datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    lines.append("sources: google_news, hacker_news, reddit")
+    lines.append(
+        "not_covered: X/Twitter, Facebook (no usable free public search API)"
+    )
+    lines.append("-" * 72)
+    if errors:
+        lines.append("source_errors:")
+        for name, err in sorted(errors.items()):
+            lines.append("  - %s: %s" % (name, err))
+        lines.append("")
+    lines.append("matches: %d" % len(matches))
+    lines.append("")
+    if not matches:
+        lines.append("(no matches)")
+    else:
+        for i, m in enumerate(matches, 1):
+            lines.append("[%d] %s" % (i, m.source))
+            lines.append("    title: %s" % m.title)
+            lines.append("    date:  %s" % (m.date or "-"))
+            lines.append("    link:  %s" % m.link)
+            lines.append("")
+    lines.append("-" * 72)
+    lines.append("summary: keyword=%r matches=%d errors=%d" % (keyword, len(matches), len(errors)))
+    return "\n".join(lines) + "\n"
+
+
+def write_results(
+    keyword: str,
+    report: str,
+    matches: List[Match],
+    errors: Dict[str, str],
+    *,
+    results_dir: Path,
+    force_path: Optional[Path],
+    want_json: bool,
+) -> Tuple[Optional[str], Optional[str]]:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    safe = sanitize_filename(keyword)
+
+    if force_path is not None:
+        txt_path = force_path
+        txt_path.parent.mkdir(parents=True, exist_ok=True)
+        if want_json:
+            if force_path.suffix.lower() == ".json":
+                json_path = force_path
+                txt_path = force_path.with_suffix(".txt")
+            else:
+                json_path = force_path.with_suffix(".json")
+        else:
+            json_path = None
+    else:
+        results_dir.mkdir(parents=True, exist_ok=True)
+        txt_path = results_dir / ("%s_%s.txt" % (safe, ts))
+        json_path = results_dir / ("%s_%s.json" % (safe, ts)) if want_json else None
+
+    path_txt = path_json = None
+    try:
+        txt_path.write_text(report, encoding="utf-8")
+        path_txt = str(txt_path)
+    except OSError as e:
+        eprint("could not write %s: %s" % (txt_path, e))
+
+    if want_json and json_path is not None:
+        payload = {
+            "tool": "scout",
+            "version": VERSION,
+            "keyword": keyword,
+            "match_count": len(matches),
+            "matches": [m.to_dict() for m in matches],
+            "source_errors": errors,
+            "sources": [n for n, _ in SOURCES],
+            "not_covered": ["x_twitter", "facebook"],
+        }
+        try:
+            json_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            path_json = str(json_path)
+        except OSError as e:
+            eprint("could not write %s: %s" % (json_path, e))
+    return path_txt, path_json
+
+
+def print_summary(
+    keyword: str,
+    matches: List[Match],
+    errors: Dict[str, str],
+    path_txt: Optional[str],
+    path_json: Optional[str],
+    quiet: bool,
+    verbose: bool,
+    report: str,
+) -> None:
+    path = path_txt or "(not saved)"
+    if quiet:
+        if errors and not matches:
+            eprint(
+                "[-] %r  matches=0  sources_failed=%s  -> %s"
+                % (keyword, ",".join(errors) or "-", path)
+            )
+        else:
+            sys.stdout.write(path + "\n")
+            sys.stdout.flush()
+        return
+
+    err_note = ""
+    if errors:
+        err_note = "  skipped=%s" % ",".join(sorted(errors.keys()))
+    sys.stdout.write(
+        "[+] %r  matches=%d%s  -> %s\n"
+        % (keyword, len(matches), err_note, path)
+    )
+    if path_json:
+        sys.stdout.write("    json -> %s\n" % path_json)
+    if verbose:
+        sys.stdout.write(report)
+    elif matches and not quiet:
+        # compact peek: first few titles
+        for m in matches[:5]:
+            sys.stdout.write(
+                "    · [%s] %s\n" % (m.source, (m.title or m.link)[:100])
+            )
+        if len(matches) > 5:
+            sys.stdout.write("    · … +%d more (see file or -v)\n" % (len(matches) - 5))
+    sys.stdout.flush()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="scout",
+        description=(
+            "Keyword monitor over free public sources: Google News RSS, "
+            "Hacker News (Algolia), Reddit JSON. "
+            "Does NOT cover X/Twitter or Facebook — they have no usable free "
+            "search API. No paid keys. Authorised / personal research use."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  scout \"ai pentest\"\n"
+            "  scout -f keywords.txt\n"
+            "  scout \"ai pentest\" --watch     # only NEW links since last run\n"
+            "  scout openai -v --json\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("keyword", nargs="?", default=None, help="Search phrase / keyword")
+    p.add_argument(
+        "-f",
+        "--file",
+        dest="keywords_file",
+        metavar="FILE",
+        help="Keywords file, one per line (# comments / blanks skipped)",
+    )
+    p.add_argument(
+        "--watch",
+        action="store_true",
+        help=(
+            "Only show matches whose link is new since last run "
+            "(seen-cache: ~/.config/cobra-scout/seen.json) — good for cron"
+        ),
+    )
+    p.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help="Write full report to this path (single keyword only)",
+    )
+    p.add_argument(
+        "--results-dir",
+        default=str(RESULTS_DIR),
+        help="Auto-save directory (default: ./scout-results)",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Also save machine-readable JSON",
+    )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print full report to the terminal",
+    )
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Only errors + saved path",
+    )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=TIMEOUT,
+        metavar="SEC",
+        help="Per-request timeout (default: %.0f)" % TIMEOUT,
+    )
+    p.add_argument(
+        "--seen-file",
+        default=str(SEEN_PATH),
+        help="Watch-mode cache path (default: ~/.config/cobra-scout/seen.json)",
+    )
+    p.add_argument("--version", action="version", version="scout %s" % VERSION)
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(list(argv) if argv is not None else None)
+
+    if args.quiet and args.verbose:
+        eprint("use either -q or -v, not both")
+        return 2
+    if args.timeout <= 0:
+        eprint("--timeout must be positive")
+        return 2
+    if args.output and args.keywords_file:
+        eprint("-o/--output is for a single keyword only (not -f)")
+        return 2
+
+    try:
+        keywords = load_keywords(args.keyword, args.keywords_file)
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else 2
+
+    if not keywords:
+        eprint('provide a keyword or -f keywords.txt  (e.g. scout "ai pentest")')
+        return 2
+    if args.output and len(keywords) != 1:
+        eprint("-o/--output requires exactly one keyword")
+        return 2
+
+    seen_path = Path(args.seen_file).expanduser()
+    seen: Set[str] = load_seen(seen_path) if args.watch else set()
+    results_dir = Path(args.results_dir)
+    force_path = Path(args.output) if args.output else None
+    any_matches = False
+
+    if not args.quiet:
+        sys.stdout.write(
+            "scout %s  keywords=%d  watch=%s  results=%s\n"
+            % (
+                VERSION,
+                len(keywords),
+                "on" if args.watch else "off",
+                results_dir if not force_path else force_path,
+            )
+        )
+        sys.stdout.flush()
+
+    for i, kw in enumerate(keywords, 1):
+        if not args.quiet and len(keywords) > 1:
+            sys.stdout.write("\n── [%d/%d] %r ──\n" % (i, len(keywords), kw))
+            sys.stdout.flush()
+        try:
+            raw_matches, errors = gather(kw, timeout=float(args.timeout))
+            matches = dedupe(raw_matches)
+            if args.watch:
+                matches = filter_new(matches, seen)
+                # mark as seen (even if we show them — after this run they're known)
+                for m in matches:
+                    if m.link:
+                        seen.add(_norm_link(m.link))
+                # also mark non-new? only add what we saw this run from all raw
+                for m in raw_matches:
+                    if m.link:
+                        seen.add(_norm_link(m.link))
+            if matches:
+                any_matches = True
+            report = format_report(kw, matches, errors, watch=bool(args.watch))
+            path_txt, path_json = write_results(
+                kw,
+                report,
+                matches,
+                errors,
+                results_dir=results_dir,
+                force_path=force_path,
+                want_json=bool(args.json),
+            )
+            print_summary(
+                kw,
+                matches,
+                errors,
+                path_txt,
+                path_json,
+                quiet=bool(args.quiet),
+                verbose=bool(args.verbose),
+                report=report,
+            )
+        except KeyboardInterrupt:
+            eprint("interrupted")
+            if args.watch:
+                try:
+                    save_seen(seen, seen_path)
+                except Exception:
+                    pass
+            return 130
+        except Exception as e:
+            eprint("[-] %r  unexpected: %s" % (kw, e))
+            continue
+
+    if args.watch:
+        try:
+            save_seen(seen, seen_path)
+        except Exception as e:
+            eprint("could not save seen-cache: %s" % e)
+
+    # exit 0 if we found something (or watch ran clean with 0 new)
+    return 0 if any_matches or args.watch else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as e:
+        eprint("fatal: %s" % e)
+        raise SystemExit(1)
