@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="CobraSEC · Blue Arsenal · scout" width="100%">
+</p>
+
 # scout
 
 **Watch free public news for a keyword. Alert only on what’s new.**
